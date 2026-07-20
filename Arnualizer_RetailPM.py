@@ -1,6 +1,7 @@
 #%% USERMANUALLY
-# F,K,T,r,sigma,cp = 1.1735,1.29,86/360,0.03625,0.5+0.70.0937,'call'
+# F,K,T,r,sigma,cp = 8.32, 8, 64/360, 0.03625, 0.6070,'call'
 # unit_price_option(model='auto',F=F,K=K,T=T,r=r,sigma=sigma,option_type=cp)
+
 #%% LIBS & CONFIGS
 import os
 import glob
