@@ -1,4 +1,4 @@
-# schwab/schwab_auth.py
+# schwabttk/schwab_auth.py
 import os
 import schwab
 from dotenv import load_dotenv
