@@ -3,6 +3,7 @@ import os
 from schwabttk.price_history import load_futures_symbols, load_stored
 from schwabttk.visualize import plot_ohlc, plot_multi, plot_corr, show
 
+
 #%% VIZ
 # Single candlestick
 fig, df = plot_ohlc("ZW", start="2017-01-01")
@@ -31,3 +32,18 @@ print(symbols)
 #%% BY SYMBOL DATA
 ssymb = 'M2K'
 data = load_stored(ssymb)
+
+#%% PRICE FEATURES
+from schwabttk.price_history import load_stored
+from schwabttk.price_features import compute_all_features
+import importlib
+import schwabttk.price_features
+importlib.reload(schwabttk.price_features)
+
+df  = load_stored("ZW")
+out = compute_all_features(df, periods=[21, 64, 128])
+
+# Check features
+out[["datetime","Pattern_1","Pattern_3","Regime"]].tail(10)
+out[["datetime","Pattern_1","Pattern_2","Pattern_3"]].tail(10)
+out[["datetime","DC_21","DC_64","DC_128"]].tail(1).T
