@@ -8,7 +8,7 @@ Same input always produces the same output — no fitting required.
 Group 1 — Candle Anatomy       : Body, Wicks, Range, Ratios, CLV
 Group 2 — Returns              : r_day, r_night, r_total (log returns)
 Group 3 — Rolling Features     : R, RV, TM, ER, DC, RVOL, VTC, VWR, VMD,
-                                  AC1/AC5/AC21, Run statistics
+                                  AC1/AC5/AC11, Run statistics
 Group 4 — Price vs EMA         : EMA, PVE, PVE_pct, EMA_slope
 Group 5 — Conviction & Momentum: Conviction, MOM
 Group 6 — Pattern Classifiers  : single, double, triple, N-candle (Regime)
@@ -104,7 +104,7 @@ def rolling_features(df: pd.DataFrame,
                     sign(r_day) matches sign(R_{p}) at window end
     AC1_{p}       : lag-1 autocorrelation of r_day over p bars
     AC5_{p}       : lag-5 autocorrelation of r_day over p bars
-    AC21_{p}      : lag-21 autocorrelation of r_day over p bars
+    AC11_{p}      : lag-11 autocorrelation of r_day over p bars
     nRunPos_{p}   : number of positive return runs in window
     nRunNeg_{p}   : number of negative return runs in window
     AvgRunPos_{p} : average positive streak length
@@ -169,6 +169,13 @@ def rolling_features(df: pd.DataFrame,
         # ── Cumulative return (log returns add) ───────────────────────────
         out[f"R{sfx}"] = r.rolling(p).sum()
 
+        # ── Trend Coherence: Corr(r(t), R_{p}(t-1))  over fixed 32-bar window
+        # Measures whether daily return magnitude aligns with cumulative momentum
+        # +1 → returns reinforce trend (big days = strong momentum days)
+        # -1 → returns fight trend (big days when momentum is weak/opposite)
+        _corr_window = 32
+        out[f"CorrRR{sfx}"] = r.rolling(_corr_window).corr(out[f"R{sfx}"].shift(1))
+
         # ── Realized Volatility ───────────────────────────────────────────
         out[f"RV{sfx}"] = np.sqrt(r.pow(2).rolling(p).sum())
 
@@ -193,7 +200,7 @@ def rolling_features(df: pd.DataFrame,
         )
 
         # ── Autocorrelation ───────────────────────────────────────────────
-        for q in [1, 5, 21]:
+        for q in [1, 5, 11]:
             out[f"AC{q}{sfx}"] = (
                 r.rolling(p)
                 .apply(
