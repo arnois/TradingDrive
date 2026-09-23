@@ -559,6 +559,35 @@ def condition_number(X: pd.DataFrame) -> float:
     return float(np.sqrt(lam_max / lam_min))
 
 
+def _kappa_from_corr(C: np.ndarray) -> float:
+    """κ = sqrt(λ_max / λ_min) of a correlation (sub)matrix."""
+    if C.shape[0] <= 1:
+        return 1.0
+    if not np.all(np.isfinite(C)):
+        return np.inf
+    eig = np.linalg.eigvalsh(C)
+    lam_min, lam_max = float(eig.min()), float(eig.max())
+    if lam_min <= 1e-12:
+        return np.inf
+    return float(np.sqrt(lam_max / lam_min))
+
+
+def communality(pca_result: dict, X: pd.DataFrame) -> pd.Series:
+    """
+    Fraction of each feature's variance explained by the retained PCs:
+        h²_f = Σ_k λ_k · v_fk² / var(f)
+
+    Unlike max|loading|, invariant to PC ordering, sign flips and rotation
+    within the retained subspace — so comparable across rolling windows.
+    """
+    pca = pca_result["pca"]
+    L   = pca_result["loadings"]
+    lam = pca.explained_variance_
+    var = X[L.index].dropna().var()
+    h2  = (L.values ** 2 * lam).sum(axis=1) / var.values
+    return pd.Series(np.clip(h2, 0, 1), index=L.index, name="communality")
+
+
 def vif_scores(X: pd.DataFrame) -> pd.Series:
     """
     Variance inflation factors: VIF_j = [R⁻¹]_jj, R = correlation matrix.
@@ -581,9 +610,21 @@ def select_features(X_std: pd.DataFrame,
                     var_floor_fraction: float = 0.10,
                     max_condition_number: float = 30.0,
                     min_pc_loading: float = 0.10,
-                    pairwise_mi_neighbors: int = 5) -> dict:
+                    pairwise_mi_neighbors: int = 5,
+                    pc_cost_method: str = "max_loading") -> dict:
     """
     Top-down feature selection via unified MI+κ iterative elimination.
+
+    Note on pairwise MI: MI(f_i, f_j) depends only on the pair, so the
+    matrix on the surviving set is exactly a submatrix of the initial one
+    (verified to 1e-15). The loop therefore subsets rather than recomputes;
+    only the data-driven threshold (quantile over surviving pairs) changes
+    between iterations. Features missing from `pairwise_mi` (e.g. because
+    of max_features capping) trigger one recomputation up front.
+
+    pc_cost_method : "max_loading" — max |loading| over retained PCs
+                     "communality" — Σ_k λ_k v_fk² / var(f); rotation- and
+                     order-invariant, preferred for rolling comparisons.
 
     Algorithm
     ---------
@@ -595,7 +636,7 @@ def select_features(X_std: pd.DataFrame,
         If already ≤ max_condition_number → done.
 
     Step 3 — Unified elimination loop (repeats until κ ≤ target):
-        a. Recompute pairwise MI on CURRENT surviving features
+        a. Pairwise MI restricted to CURRENT surviving features
         b. Recompute κ; stop if target met
         c. Re-identify redundancy clusters from fresh pairwise MI
            (edge if MI > pmi_quantile of positive off-diagonal MI)
@@ -626,10 +667,25 @@ def select_features(X_std: pd.DataFrame,
     loadings  = pca_result["loadings"]
     gvar      = variance_rank["global_var"]
 
+    if pc_cost_method == "communality":
+        _cost_vals = communality(pca_result, X_clean)
+    elif pc_cost_method == "max_loading":
+        _cost_vals = loadings.abs().max(axis=1)
+    else:
+        raise ValueError(f"unknown pc_cost_method '{pc_cost_method}'")
+
     def _pc_cost(f):
-        c = float(loadings.loc[f].abs().max()) if f in loadings.index \
-            else min_pc_loading
+        c = float(_cost_vals[f]) if f in _cost_vals.index else min_pc_loading
         return max(c, min_pc_loading)
+
+    # Correlation matrix computed once; κ of any subset = κ of its submatrix
+    _cols  = list(X_clean.columns)
+    _pos   = {c: i for i, c in enumerate(_cols)}
+    _Cfull = np.corrcoef(X_clean.values, rowvar=False)
+
+    def _kappa(feats):
+        idx = [_pos[f] for f in feats]
+        return _kappa_from_corr(_Cfull[np.ix_(idx, idx)])
 
     # ── Step 1: Variance floor ────────────────────────────────────────────
     median_var   = float(gvar.median())
@@ -646,7 +702,7 @@ def select_features(X_std: pd.DataFrame,
     print(f"[INFO] Surviving after variance floor: {len(surviving)}")
 
     # ── Step 2: κ baseline ────────────────────────────────────────────────
-    kappa_baseline = condition_number(X_clean[surviving])
+    kappa_baseline = _kappa(surviving)
     print(f"\n[INFO] κ baseline: {kappa_baseline:.2f} "
           f"(target ≤ {max_condition_number})")
 
@@ -654,6 +710,15 @@ def select_features(X_std: pd.DataFrame,
     dropped_features = list(flat_dropped)
     n_iterations     = 0
     current_pmi      = pairwise_mi
+
+    # Fill the gap once if the initial PMI does not cover every survivor
+    uncovered = [f for f in surviving if f not in pairwise_mi.index]
+    if uncovered and kappa_baseline > max_condition_number:
+        print(f"[INFO] {len(uncovered)} survivors missing from pairwise MI — "
+              f"recomputing once on {len(surviving)} features")
+        pairwise_mi = current_pmi = _pairwise_mi(
+            X_clean[surviving], n_neighbors=pairwise_mi_neighbors
+        )
 
     if kappa_baseline <= max_condition_number:
         print(f"[INFO] Already within target — no elimination needed")
@@ -663,7 +728,7 @@ def select_features(X_std: pd.DataFrame,
 
         while True:
             n_iterations += 1
-            kappa_now     = condition_number(X_clean[surviving])
+            kappa_now     = _kappa(surviving)
 
             print(f"\n{div}")
             print(f"[ITER {n_iterations}] κ={kappa_now:.2f} | "
@@ -677,17 +742,9 @@ def select_features(X_std: pd.DataFrame,
                 print(f"  [WARN] Only 1 feature remaining — stopping")
                 break
 
-            # Step 3a: Pairwise MI on current surviving set
-            if n_iterations > 1:
-                print(f"  Recomputing pairwise MI on {len(surviving)} "
-                      f"surviving features...")
-                current_pmi = _pairwise_mi(
-                    X_clean[surviving], n_neighbors=pairwise_mi_neighbors
-                )
-            else:
-                surv_in_pmi = [f for f in surviving
-                               if f in current_pmi.index]
-                current_pmi = current_pmi.loc[surv_in_pmi, surv_in_pmi]
+            # Step 3a: Pairwise MI on current surviving set (exact submatrix)
+            surv_in_pmi = [f for f in surviving if f in pairwise_mi.index]
+            current_pmi = pairwise_mi.loc[surv_in_pmi, surv_in_pmi]
 
             # Step 3b: Data-driven PMI threshold
             pmi_vals = current_pmi.values[
@@ -750,7 +807,7 @@ def select_features(X_std: pd.DataFrame,
                 candidate = [x for x in surviving if x != f]
                 if len(candidate) < 1:
                     continue
-                k_after        = condition_number(X_clean[candidate])
+                k_after        = _kappa(candidate)
                 k_after_map[f] = k_after
                 scores[f]      = (kappa_now - k_after) / _pc_cost(f)
 
@@ -785,7 +842,7 @@ def select_features(X_std: pd.DataFrame,
                   f"pc_cost={pc_cost:.4f}")
 
     # ── Step 4: Post-selection ────────────────────────────────────────────
-    kappa_final = condition_number(X_clean[surviving])
+    kappa_final = _kappa(surviving)
     vif_final   = vif_scores(X_clean[surviving]) \
                   if len(surviving) > 1 else pd.Series(dtype=float)
 
@@ -936,6 +993,7 @@ def run_full_analysis(df: pd.DataFrame,
                       var_floor_fraction: float = 0.10,
                       max_condition_number: float = 30.0,
                       min_pc_loading: float = 0.10,
+                      pc_cost_method: str = "max_loading",
                       min_obs: int = 128) -> FeatureAnalysisResult:
     """
     Run the full feature analysis pipeline.
@@ -1024,6 +1082,7 @@ def run_full_analysis(df: pd.DataFrame,
         max_condition_number=max_condition_number,
         min_pc_loading=min_pc_loading,
         pairwise_mi_neighbors=pairwise_mi_neighbors,
+        pc_cost_method=pc_cost_method,
     )
     sel = sel_out["selected_features"]
     result.selected_features = sel

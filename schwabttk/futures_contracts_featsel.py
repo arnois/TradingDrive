@@ -1,11 +1,21 @@
-#%% PRICE FEATURES
+#%% LIBS
+import os
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from schwabttk.price_history import load_stored
 from schwabttk.price_features import compute_all_features
+from schwabttk.visualize import show
 # import importlib
 # import schwabttk.price_features
 # importlib.reload(schwabttk.price_features)
 
-SYM     = "ZW"
+#%% Paths
+BASE_DIR = os.path.dirname(os.path.dirname(__file__)) # BASE_DIR = os.getcwd()
+
+#%% PRICE FEATURES
+SYM = "ZW"
 PERIODS = [21, 64, 128]
 
 df  = load_stored(SYM)
@@ -205,6 +215,89 @@ membership["n_runs"] = membership.sum(axis=1)
 membership.sort_values("n_runs", ascending=False)
 # Features kept in every run = the stable core. Features that flip in and out
 # are interchangeable members of the same MI cluster.
+
+#%% ROLLING 1 — walk-forward selection (W = 5y, H = 64 bars)
+# import importlib, schwabttk.feature_rolling as fr; importlib.reload(fr)
+from schwabttk.feature_rolling import (
+    rolling_selection, RollingSelectionResult, selection_stability,
+    effective_selection, selected_as_of, expand_to_bars,
+    plot_selection_heatmap, plot_diagnostic_heatmap,
+    plot_stability, plot_feature_history,
+)
+
+ROLL_W, ROLL_H = 1260, 64          # 5 years of daily bars, refit every 64 bars
+ROLL_FILE = os.path.join(BASE_DIR, "data", f"rolling_sel_{SYM}_W{ROLL_W}_H{ROLL_H}.pkl")
+
+if os.path.exists(ROLL_FILE):      # expensive → cache; delete file to refit
+    rsel = RollingSelectionResult.load(ROLL_FILE)
+else:
+    rsel = rolling_selection(
+        out,
+        periods=PERIODS,
+        window=ROLL_W,
+        step=ROLL_H,
+        expanding=False,
+        max_condition_number=30.0,
+        pmi_quantile=0.50,
+        pc_cost_method="communality",
+        n_jobs=-1,                 # windows run in parallel
+    )
+    rsel.save(ROLL_FILE)
+
+rsel.windows.round(2)
+
+#%% ROLLING 2 — effective set for the backtest + stability
+# "hysteresis": enter on first selection, leave after k_out consecutive misses;
+# respect_kappa=True drops carried features again if they break the κ target.
+eff  = effective_selection(rsel, rule="hysteresis", k_out=2, respect_kappa=True)
+stab = selection_stability(rsel, lookback=4, effective=eff)
+
+print(f"Overall Nogueira stability : {stab['nogueira_overall']:.3f}")
+print(f"Mean set changes per refit : raw {(stab['timeline'].added + stab['timeline'].removed).mean():.2f}"
+      f" | effective {stab['timeline'].eff_turnover.mean():.2f}")
+print("\n── Selection frequency across all refits ──")
+print(stab["overall_frequency"].round(2).to_string())
+stab["timeline"].round(2)
+
+#%% ROLLING 3 — selection heatmap: which features survive, when
+fig = plot_selection_heatmap(rsel, effective=eff,
+                             title=f"{SYM} — rolling selection (W={ROLL_W}, H={ROLL_H})")
+show(fig, f"{SYM}_rolling_selection")
+
+#%% ROLLING 4 — stability timeline: κ, set size, Jaccard / Nogueira
+fig = plot_stability(rsel, stab)
+show(fig, f"{SYM}_rolling_stability")
+
+#%% ROLLING 5 — why features flip: path-independent diagnostics
+# "loo_dlogk" | "log_vif" | "max_ic" | "communality"
+for name in ["max_ic", "communality"]:
+    fig = plot_diagnostic_heatmap(rsel, name)
+    show(fig, f"{SYM}_rolling_{name}")
+
+#%% ROLLING 6 — drill into one feature
+# Pick the least stable one by default (frequency closest to 50%)
+freq  = stab["overall_frequency"]
+FEAT  = (freq - 0.5).abs().idxmin()
+print(f"Feature: {FEAT}  (selected in {freq[FEAT]:.0%} of refits)")
+fig = plot_feature_history(rsel, FEAT)
+show(fig, f"{SYM}_history_{FEAT}")
+
+# Elimination path at a specific refit (e.g. the last one)
+d = rsel.refit_dates[-1]
+pd.DataFrame(rsel.details[d]["kappa_path"]).set_index("iteration")
+
+#%% ROLLING 7 — backtest hooks
+# Set to use at any bar t = effective set frozen at the last refit ≤ t
+t = rsel.refit_dates[len(rsel.refit_dates) // 2] + pd.Timedelta(days=10)
+print(f"Features as of {t.date()}:",
+      selected_as_of(rsel, t, rule="hysteresis", k_out=2))
+
+# Bar-level mask (bar × feature) for the backtest loop.
+# lag=1 → a set refit at the close of day d is first used on day d+1.
+mask = expand_to_bars(rsel, eff, lag=1)
+print(f"Mask: {mask.shape} | first usable bar: "
+      f"{mask.index[mask.any(axis=1)][0].date()}")
+mask.tail()
 
 #%% TREND SCORE :: FEATURE PROCESS
 from schwabttk.trend_score import trend_score_pipeline
