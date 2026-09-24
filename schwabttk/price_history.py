@@ -46,21 +46,37 @@ def load_stored(ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def save_stored(ticker: str, df: pd.DataFrame):
-    """Save DataFrame to parquet, sorted and deduplicated."""
-    df = df.drop_duplicates(subset="datetime")
+    """
+    Save DataFrame to csv, sorted and deduplicated.
+
+    keep="last" is deliberate: when a freshly-fetched bar overlaps a
+    datetime we already had stored, the new value wins. That's what lets
+    a re-pull correct (a) vendor revisions to historical bars and
+    (b) a bar that was still in-progress (market not yet closed) the
+    last time it was fetched.
+    """
+    df = df.drop_duplicates(subset="datetime", keep="last")
     df = df.sort_values("datetime").reset_index(drop=True)
     df.to_csv(get_storage_path(ticker), index=False)
 
 def get_missing_ranges(stored: pd.DataFrame,
                        start: datetime,
-                       end: datetime) -> list[tuple]:
+                       end: datetime,
+                       refresh_days: int = 5) -> list[tuple]:
     """
     Compare requested date range against stored data.
     Returns list of (range_start, range_end) tuples that need to be fetched.
-    Handles three cases:
-      1. No stored data         → fetch full range
-      2. Stored data exists     → fetch only missing head/tail
-      3. Fully covered          → nothing to fetch
+
+    Beyond the original head/tail gap logic, this now ALWAYS re-fetches the
+    most recent `refresh_days` of already-stored data (clipped to the
+    requested window). That covers two cases the old "fully covered" check
+    missed:
+      1. The vendor revised/corrected a previously published bar.
+      2. The last pull happened while the session/market was still open,
+         so the newest stored bar was an incomplete, in-progress candle
+         that has since finalized to a different value.
+
+    Set refresh_days=0 to restore the old "only fetch true gaps" behavior.
     """
     if stored.empty:
         print(f"    → No local data found. Will fetch full range.")
@@ -84,6 +100,20 @@ def get_missing_ranges(stored: pd.DataFrame,
         gap_start = stored_end + timedelta(days=1)
         print(f"    → Missing tail: {gap_start.date()} to {end.date()}")
         ranges.append((gap_start, end))
+
+    # Re-fetch the tail of what we already have, to catch revisions and
+    # replace any bar that was incomplete last time it was pulled.
+    if refresh_days > 0:
+        refresh_start = max(start, stored_end - timedelta(days=refresh_days - 1))
+        refresh_end   = min(end, stored_end)
+
+        if refresh_start <= refresh_end:
+            already_covered = any(r_start <= refresh_start and r_end >= refresh_end
+                                   for r_start, r_end in ranges)
+            if not already_covered:
+                print(f"    → Refreshing recent data: {refresh_start.date()} to "
+                      f"{refresh_end.date()} (revisions / incomplete last bar)")
+                ranges.append((refresh_start, refresh_end))
 
     if not ranges:
         print(f"    → Fully covered. No fetch needed.")
@@ -133,15 +163,19 @@ def fetch_from_schwab(client: Client,
 def pull_all(start: datetime,
              end: datetime,
              frequency_type: str = "daily",
-             frequency: int = 1) -> dict:
+             frequency: int = 1,
+             refresh_days: int = 5) -> dict:
     """
-    Smart pull: only fetches what is not already stored.
-    Appends new data to existing parquet files.
+    Smart pull: fetches missing head/tail ranges plus a re-fetch of the
+    most recent `refresh_days` of stored data (to catch vendor revisions
+    and any bar that was incomplete when last pulled). New data always
+    overwrites old data for the same datetime — see save_stored().
     """
     FUTURES = load_futures_symbols()
     print(f"\n{'='*60}")
     print(f"  Requested range : {start.date()} → {end.date()}")
     print(f"  Frequency       : {frequency} {frequency_type}")
+    print(f"  Refresh window  : last {refresh_days} day(s) of stored data")
     print(f"  Symbols         : {list(FUTURES.keys())}")
     print(f"{'='*60}\n")
 
@@ -155,7 +189,7 @@ def pull_all(start: datetime,
         stored = load_stored(ticker)
 
         # Determine what needs to be fetched
-        missing_ranges = get_missing_ranges(stored, start, end)
+        missing_ranges = get_missing_ranges(stored, start, end, refresh_days=refresh_days)
 
         if not missing_ranges:
             # Nothing to fetch — clip stored to requested range and return
@@ -165,7 +199,7 @@ def pull_all(start: datetime,
             print(f"    ✓ Loaded {len(results[ticker])} bars from local storage\n")
             continue
 
-        # Fetch each missing range from Schwab
+        # Fetch each missing/refresh range from Schwab
         new_frames = []
         for (r_start, r_end) in missing_ranges:
             print(f"    → Fetching from Schwab: {r_start.date()} to {r_end.date()}")
@@ -173,7 +207,7 @@ def pull_all(start: datetime,
                                        frequency_type, frequency)
             if not df_new.empty:
                 new_frames.append(df_new)
-                print(f"    ✓ Got {len(df_new)} new bars")
+                print(f"    ✓ Got {len(df_new)} bars")
 
         if not new_frames:
             print(f"    [WARN] No new data retrieved\n")
@@ -181,12 +215,18 @@ def pull_all(start: datetime,
                 results[ticker] = stored
             continue
 
-        # Merge new data with stored data
+        # Merge new data with stored data. Concat order matters: stored
+        # first, new_frames last, so drop_duplicates(keep="last") in
+        # save_stored() lets freshly-fetched bars overwrite stale/stored
+        # ones that share the same datetime (revisions, incomplete bars).
         combined = pd.concat([stored] + new_frames, ignore_index=True)
         save_stored(ticker, combined)
 
+        # Reload from disk so `results` reflects the deduplicated,
+        # authoritative version actually written to storage.
+        combined = load_stored(ticker)
+
         # Return only the requested range
-        combined["datetime"] = pd.to_datetime(combined["datetime"])
         mask = (combined["datetime"] >= pd.Timestamp(start)) & \
                (combined["datetime"] <= pd.Timestamp(end))
         results[ticker] = combined[mask].reset_index(drop=True)
@@ -215,6 +255,13 @@ if __name__ == "__main__":
                         help="Bar frequency type (default: daily)")
     parser.add_argument("--frequency", type=int, default=1,
                         help="Bar frequency size (default: 1)")
+    parser.add_argument("--refresh-days", type=int, default=5,
+                        help="Always re-fetch this many trailing days of "
+                             "already-stored data, to pick up vendor "
+                             "revisions and finalize any bar that was still "
+                             "in-progress (market not yet closed) when it "
+                             "was last pulled. Use 0 to disable and only "
+                             "fetch true gaps (default: 5)")
     args = parser.parse_args()
 
     start_dt = datetime.strptime(args.start, "%Y-%m-%d")
@@ -224,7 +271,8 @@ if __name__ == "__main__":
         start=start_dt,
         end=end_dt,
         frequency_type=args.frequency_type,
-        frequency=args.frequency
+        frequency=args.frequency,
+        refresh_days=args.refresh_days
     )
 
     # Quick preview
